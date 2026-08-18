@@ -78,13 +78,19 @@
  * path as a manual toggle, and restore to whatever the user's own
  * hide/show choice was once the overlay closes.
  *
- * The nav button's position/size is a fixed CSS anchor (.icx-nav-toggle),
- * not computed from the container - an earlier version tracked
- * Container_D91DDFDB.../Container_9E80E91A...'s live actualWidth and
- * anchored under it, but that container is a full-height (100%) sidebar,
- * so "under the container" landed off the bottom of the viewport, and
- * per feedback the button shouldn't resize/move at all - it should just
- * stay put.
+ * Both toggle buttons are icon-only (no text label) and sit at a single
+ * fixed position - top:50%, right:20px, vertically centered - the same
+ * convention used on the Kizuna/Kokoro tour: an open eye means the panel
+ * is currently visible (click to hide it), a closed eye means it's
+ * currently hidden (click to show it). Landmarks and Navigation never
+ * show at the same time (they're gated to disjoint sets of scenes), so
+ * both buttons safely share the same screen position without colliding.
+ * An earlier version tracked the live geometry of the native 3DVista
+ * bottom chrome every frame to anchor the buttons' `bottom` offset just
+ * above it - that whole system (BUTTON_CLEARANCE_COMPONENT_IDS,
+ * getButtonBottomPx, the sidebar content-card measurement, etc.) is gone
+ * now that the buttons live at a fixed position unrelated to the bottom
+ * chrome's own geometry.
  *
  * Install: paste this whole IIFE into the Player's "On Start" JavaScript
  * action in 3DVista:
@@ -513,6 +519,29 @@
         root.id = ROOT_ID;
         document.body.appendChild(root);
 
+        // The browser Fullscreen API only renders the fullscreened
+        // element's own subtree - everything outside it, siblings
+        // included, stops rendering entirely even though nothing about
+        // their own state changed. `root` lives under <body> as a
+        // sibling of #viewer (3DVista's own container), so the instant
+        // the tour's native fullscreen button fires - whatever element it
+        // targets - our buttons went fully invisible, reported live as
+        // "buttons not showing in fullscreen." Reparenting `root` into
+        // document.fullscreenElement on fullscreenchange (and back to
+        // body on exit) keeps it in the render tree either way;
+        // position:fixed still sizes against the real viewport since
+        // reparenting doesn't change that unless an ancestor gets a
+        // transform/filter/perspective (confirmed live #viewer has none).
+        function relocateRootForFullscreen() {
+            var fsEl = document.fullscreenElement || document.webkitFullscreenElement ||
+                document.mozFullScreenElement || document.msFullscreenElement;
+            var target = fsEl || document.body;
+            if (root.parentNode !== target) target.appendChild(root);
+        }
+        ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange'].forEach(function (evt) {
+            document.addEventListener(evt, relocateRootForFullscreen);
+        });
+
         var EYE_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
             '<path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg>';
         var EYE_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
@@ -530,40 +559,43 @@
 
         var landmarksBtn = makeButton('icx-landmarks-toggle');
         var navBtn = makeButton('icx-nav-toggle');
-        var navRevealBtn = makeButton('icx-nav-reveal');
-        navRevealBtn.innerHTML = EYE_OPEN;
-        navRevealBtn.title = 'Show Navigation';
-        navRevealBtn.setAttribute('aria-label', 'Show Navigation');
 
+        // Icon reflects CURRENT state, not the upcoming action: open eye =
+        // the panel is visible right now (click hides it), closed eye =
+        // it's hidden right now (click shows it) - same convention as the
+        // Kizuna/Kokoro tour's toggle.
         function paintLandmarksBtn() {
             var hidden = !landmarksVisible;
-            landmarksBtn.innerHTML = (hidden ? EYE_OPEN : EYE_OFF) + '<span>' + (hidden ? 'Show Landmarks' : 'Hide Landmarks') + '</span>';
-            landmarksBtn.removeAttribute('title');
-            landmarksBtn.removeAttribute('aria-label');
+            landmarksBtn.innerHTML = hidden ? EYE_OPEN : EYE_OFF;
+            landmarksBtn.title = hidden ? 'Show Landmarks' : 'Hide Landmarks';
+            landmarksBtn.setAttribute('aria-label', landmarksBtn.title);
         }
         landmarksBtn.onclick = function () { setLandmarksVisible(!landmarksVisible); };
 
-        function paintNavBtn(cfg) {
-            var hidden = navHidden;
-            navBtn.innerHTML = (hidden ? EYE_OPEN : EYE_OFF) + '<span>' + (hidden ? 'Show Navigation' : 'Hide Navigation') + '</span>';
-            navBtn.removeAttribute('title');
-            navBtn.removeAttribute('aria-label');
-            navBtn.onclick = function () { setNavHidden(!navHidden); };
-            navRevealBtn.onclick = function () { setNavHidden(false); };
+        function paintNavBtn() {
+            navBtn.innerHTML = navHidden ? EYE_OPEN : EYE_OFF;
+            navBtn.title = navHidden ? 'Show Navigation' : 'Hide Navigation';
+            navBtn.setAttribute('aria-label', navBtn.title);
         }
+        navBtn.onclick = function () { setNavHidden(!navHidden); };
 
         // ---- Single per-frame loop: scene detection, landmarks fade,
-        // nav opacity tween + continuous re-assertion, positioning, and
-        // blocking-overlay suppression all live here so they react to
-        // each other on the same tick (an overlay opening mid-fade, a
-        // scene change mid-fade, etc. never fight each other a frame
-        // apart). See header comment for why this needs to run every
-        // frame rather than on a slower poll.
+        // nav opacity tween + continuous re-assertion, and blocking-
+        // overlay suppression all live here so they react to each other
+        // on the same tick (an overlay opening mid-fade, a scene change
+        // mid-fade, etc. never fight each other a frame apart). See
+        // header comment for why this needs to run every frame rather
+        // than on a slower poll.
 
         var lastPanoramaId = null;
         var lastNavKey = null;
         var lastPaintedNavKey = null;
         var lastPaintedNavHidden = null;
+
+        // Held across frames where currentId fails to resolve at all (see
+        // frameLoop below) - not the same thing as lastNavKey, which tracks
+        // the last *resolved* key for animation purposes.
+        var lastResolvedNavCfg = null;
 
         var navOpacity = navHidden ? 0 : 1;
         var navAnimFrom = navOpacity;
@@ -576,27 +608,46 @@
             var sceneChanged = currentId !== lastPanoramaId;
             lastPanoramaId = currentId;
 
-            var hasTourScene = !!currentId;
+            var blockingOverlayOpen = isBlockingOverlayOpen();
             var isLandmarkScene = landmarkPanoramaIds.indexOf(currentId) !== -1;
-            var navCfg = getNavConfigForPanorama(currentId);
-            var blockerActive = isBlockingOverlayOpen();
+            var rawNavCfg = getNavConfigForPanorama(currentId);
 
-            // Keep the UI completely off the landing screen and other non-tour
-            // areas even if the root is injected globally.
-            root.classList.toggle('icx-hidden', !hasTourScene);
-
-            var blockingOverlayOpen = blockerActive;
+            // Scene loads in this tour can block the main thread heavily
+            // enough that our own per-frame correction goes hundreds of ms
+            // between ticks (confirmed live: as few as 7 animation frames
+            // over a 4-second transition, instead of the ~240 a healthy
+            // 60fps run would give). During exactly that gap, currentId can
+            // briefly fail to resolve to anything (the new panorama isn't
+            // registered as "current" yet) - getNavConfigForPanorama(null)
+            // then returns null, which used to make this whole block skip
+            // re-asserting the hidden state and the button collapse its
+            // 'icx-visible' class, both flickering back the moment
+            // currentId resolves again. Holding the last *resolved* navCfg
+            // through an unresolved-id gap (but only when we're not
+            // confidently somewhere else, like a landmark scene) keeps the
+            // correction running and the button's visibility stable across
+            // exactly the gap that caused the glitch.
+            var navCfg;
+            if (rawNavCfg) {
+                navCfg = rawNavCfg;
+                lastResolvedNavCfg = rawNavCfg;
+            } else if (!currentId && !isLandmarkScene && lastResolvedNavCfg) {
+                navCfg = lastResolvedNavCfg;
+            } else {
+                navCfg = null;
+                lastResolvedNavCfg = null;
+            }
 
             // Landmarks
             var onLandmarkScene = tourEntered && isLandmarkScene;
-            landmarksBtn.classList.toggle('icx-visible', onLandmarkScene && !blockingOverlayOpen && !!currentId);
-            applyLandmarksEffective(onLandmarkScene && landmarksVisible && !blockingOverlayOpen && !!currentId, sceneChanged);
+            landmarksBtn.classList.toggle('icx-visible', onLandmarkScene && !blockingOverlayOpen);
+            applyLandmarksEffective(onLandmarkScene && landmarksVisible && !blockingOverlayOpen, sceneChanged);
 
             // Navigation
             var navKeyChanged = (navCfg ? navCfg.key : null) !== lastNavKey;
             lastNavKey = navCfg ? navCfg.key : null;
 
-            if (navCfg && !!currentId) {
+            if (navCfg) {
                 var navSuppressed = isFullScreenOverlayOpen();
                 var navTarget = navHidden || navSuppressed;
                 if (navKeyChanged) {
@@ -617,22 +668,21 @@
                 applyNavVisual(navCfg, navOpacity, navTarget);
 
                 if (navCfg.key !== lastPaintedNavKey || navHidden !== lastPaintedNavHidden) {
-                    paintNavBtn(navCfg);
+                    paintNavBtn();
                     lastPaintedNavKey = navCfg.key;
                     lastPaintedNavHidden = navHidden;
                 }
 
-                navBtn.classList.toggle('icx-visible', !navHidden && !navSuppressed && !!currentId);
-                navRevealBtn.classList.toggle('icx-visible', navHidden && !navSuppressed && !!currentId);
+                navBtn.classList.toggle('icx-visible', !navSuppressed);
             } else {
                 navBtn.classList.remove('icx-visible');
-                navRevealBtn.classList.remove('icx-visible');
             }
 
             requestAnimationFrame(frameLoop);
         }
 
         paintLandmarksBtn();
+        paintNavBtn();
         requestAnimationFrame(frameLoop);
     }
 
@@ -643,20 +693,12 @@
         styleEl.id = STYLE_ID;
         styleEl.textContent =
             '#' + ROOT_ID + '{position:fixed;inset:0;z-index:2147483646;font-family:Arial,Helvetica,sans-serif;pointer-events:none;}' +
-            '#' + ROOT_ID + '.icx-hidden{display:none;}' +
-            '.icx-toggle-btn{position:fixed;display:flex;align-items:center;justify-content:center;gap:8px;min-height:44px;color:#fff;border:1px solid rgba(255,255,255,.28);border-radius:0;padding:10px 8px;font-family:inherit;font-weight:800;font-size:12.5px;letter-spacing:.04em;text-transform:uppercase;line-height:1.2;text-align:center;cursor:pointer;box-shadow:0 10px 24px rgba(0,0,0,.22);background:rgba(255,255,255,.14);-webkit-backdrop-filter:blur(14px) saturate(150%);backdrop-filter:blur(14px) saturate(150%);white-space:normal;pointer-events:none;opacity:0;transform:translateY(12px) scale(.98);transition:opacity 340ms ease, transform 340ms cubic-bezier(.22,1,.36,1), box-shadow 220ms ease, background 180ms ease;}' +
-            '.icx-toggle-btn.icx-visible{opacity:1;pointer-events:auto;transform:translateY(0) scale(1);}' +
-            '.icx-toggle-btn.icx-visible:hover{transform:translateY(-2px) scale(1.03);box-shadow:0 14px 28px rgba(0,0,0,.3);background:rgba(255,255,255,.24);}' +
-            '.icx-toggle-btn:active{transform:scale(.96);}' +
+            '.icx-toggle-btn{position:fixed;top:50%;right:20px;transform:translateY(-50%) translateX(16px) scale(.9);display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:50%;color:#fff;border:1px solid rgba(255,255,255,.28);cursor:pointer;box-shadow:0 10px 24px rgba(0,0,0,.22);background:rgba(0,0,0,.32);-webkit-backdrop-filter:blur(14px) saturate(150%);backdrop-filter:blur(14px) saturate(150%);pointer-events:none;opacity:0;transition:opacity 260ms ease, transform 260ms cubic-bezier(.22,1,.36,1), box-shadow 220ms ease, background 180ms ease;}' +
+            '.icx-toggle-btn.icx-visible{opacity:1;pointer-events:auto;transform:translateY(-50%) translateX(0) scale(1);}' +
+            '.icx-toggle-btn.icx-visible:hover{transform:translateY(-50%) scale(1.08);box-shadow:0 14px 28px rgba(0,0,0,.3);background:rgba(255,255,255,.24);}' +
+            '.icx-toggle-btn:active{transform:translateY(-50%) scale(.94);}' +
             '.icx-toggle-btn:focus-visible{outline:2px solid #fff;outline-offset:2px;}' +
-            '.icx-landmarks-toggle{left:20px;bottom:150px;width:min(230px,calc(100vw - 70px));}' +
-            '.icx-nav-toggle{left:20px;bottom:150px;width:min(230px,calc(100vw - 70px));}' +
-            '.icx-nav-reveal{top:50%;left:12px;transform:translateY(-50%) translateX(-120%);width:48px;height:48px;min-height:48px;border-radius:50%;padding:0;}' +
-            '.icx-nav-reveal.icx-visible{transform:translateY(-50%) translateX(0);}' +
-            '.icx-nav-reveal.icx-visible:hover{transform:translateY(-50%) scale(1.08);}' +
-            '.icx-toggle-btn svg{width:16px;height:16px;flex-shrink:0;}' +
-            '.icx-nav-reveal svg{width:22px;height:22px;}' +
-            '.icx-toggle-btn svg path,.icx-toggle-btn svg circle{stroke:#fff;}';
+            '.icx-toggle-btn svg{width:22px;height:22px;stroke:#fff;}';
         document.head.appendChild(styleEl);
     }
 })(this);
